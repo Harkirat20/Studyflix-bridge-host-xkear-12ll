@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1920">
+<title>StudyFlix Player Bridge</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #player, #player iframe { width: 100%; height: 100%; }
+  #msg { color: #bbb; font: 24px sans-serif; padding: 40px; display: none; }
+</style>
+</head>
+<body>
+<div id="player"></div><div id="msg"></div>
+<!-- Hosted HTTPS page that plays one YouTube video and talks to the
+     StudyFlix TV app over postMessage. Protocol:
+       parent -> bridge : {type:"SF_LOAD",videoId,start} {type:"SF_PLAY"}
+         {type:"SF_PAUSE"} {type:"SF_SEEK",seconds} {type:"SF_SPEED",rate}
+       bridge -> parent : SF_READY SF_STATE{playing,currentTime,duration,rate,videoId}
+         SF_TIME{...} SF_ENDED{videoId} SF_ERROR{code}                          -->
+<script>
+(function () {
+  "use strict";
+  var player = null, apiReady = false, pending = null, timeTimer = null;
+  var targetOrigin = "*"; // first message pins the parent's origin
+  var msg = document.getElementById("msg");
+  function post(m) { parent.postMessage(Object.assign({ source: "studyflix-bridge" }, m), targetOrigin); }
+  function state() {
+    if (!player || !player.getPlayerState) return;
+    var st = { playing: false, currentTime: 0, duration: 0, rate: 1, videoId: "" };
+    try {
+      st.playing = player.getPlayerState() === YT.PlayerState.PLAYING;
+      st.currentTime = player.getCurrentTime() || 0;
+      st.duration = player.getDuration() || 0;
+      st.rate = player.getPlaybackRate ? player.getPlaybackRate() : 1;
+      st.videoId = (player.getVideoData && player.getVideoData().video_id) || "";
+    } catch (e) {}
+    return st;
+  }
+  function startTicker() {
+    stopTicker();
+    timeTimer = setInterval(function () {
+      var st = state(); if (st) post(Object.assign({ type: "SF_TIME" }, st));
+    }, 500);
+  }
+  function stopTicker() { if (timeTimer) { clearInterval(timeTimer); timeTimer = null; } }
+
+  window.onYouTubeIframeAPIReady = function () {
+    apiReady = true;
+    player = new YT.Player("player", {
+      width: "100%", height: "100%",
+      playerVars: { autoplay: 0, controls: 0, rel: 0, playsinline: 1, origin: location.origin },
+      events: {
+        onReady: function () {
+          var f = document.querySelector("#player iframe");
+          if (f) f.setAttribute("referrerpolicy", "strict-origin-when-cross-origin");
+          post({ type: "SF_READY" });
+          if (pending) doLoad(pending);
+        },
+        onStateChange: function (e) {
+          var st = state() || {};
+          if (e.data === YT.PlayerState.ENDED) { stopTicker(); post({ type: "SF_ENDED", videoId: st.videoId }); return; }
+          if (e.data === YT.PlayerState.PLAYING) startTicker(); else stopTicker();
+          post(Object.assign({ type: "SF_STATE" }, st));
+        },
+        onError: function (e) { post({ type: "SF_ERROR", code: e.data }); },
+      },
+    });
+  };
+
+  function doLoad(m) {
+    if (!apiReady || !player || !player.loadVideoById) { pending = m; return; }
+    pending = null;
+    try {
+      player.loadVideoById({ videoId: m.videoId, startSeconds: m.start || 0 });
+      if (m.rate && player.setPlaybackRate) player.setPlaybackRate(m.rate);
+    } catch (e) { post({ type: "SF_ERROR", code: 5 }); }
+  }
+
+  window.addEventListener("message", function (ev) {
+    var m = ev.data || {};
+    if (m.source !== "studyflix-app") return;
+    // The TV app runs from a local widget origin, which browsers report as
+    // the string "null" (opaque origin). Pinning that as the reply target
+    // can make postMessage drop our replies, so only pin real origins and
+    // keep "*" for opaque ones. The app validates our origin on its side.
+    if (targetOrigin === "*" && ev.origin && ev.origin !== "null") targetOrigin = ev.origin;
+    if (ev.origin && targetOrigin !== "*" && ev.origin !== targetOrigin) return;
+    try {
+      switch (m.type) {
+        case "SF_LOAD": doLoad(m); break;
+        case "SF_PLAY": player && player.playVideo && player.playVideo(); break;
+        case "SF_PAUSE": player && player.pauseVideo && player.pauseVideo(); break;
+        case "SF_SEEK": player && player.seekTo && player.seekTo(Math.max(0, (player.getCurrentTime() || 0) + (m.delta || 0)), true); break;
+        case "SF_SEEK_TO": player && player.seekTo && player.seekTo(Math.max(0, m.seconds || 0), true); break;
+        case "SF_SPEED": player && player.setPlaybackRate && player.setPlaybackRate(m.rate || 1); break;
+      }
+    } catch (e) { post({ type: "SF_ERROR", code: 5 }); }
+  });
+
+  if (!navigator.onLine) { msg.style.display = "block"; msg.textContent = "Offline — cannot reach YouTube."; }
+  var tag = document.createElement("script");
+  tag.src = "https://www.youtube.com/iframe_api";
+  tag.onerror = function () { post({ type: "SF_ERROR", code: "bridge" }); };
+  document.head.appendChild(tag);
+})();
+</script>
+</body>
+</html>
